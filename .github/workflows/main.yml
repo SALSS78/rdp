@@ -6,261 +6,122 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    # Note: GitHub-hosted runners are limited by GitHub (job execution time ≈ 6 hours).
+    timeout-minutes: 360
 
     steps:
       - name: Set PowerShell execution policy for this job
-        run: |
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
         shell: powershell
+        run: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
           try {
-            Write-Host "Configuring RDP settings..."
-            # Enable Remote Desktop
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-              -Name "fDenyTSConnections" -Value 0 -Force
-
-            # Disable Network Level Authentication only if explicitly required.
-            # (If you want NLA, set UserAuthentication to 1 & ensure account has password)
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-              -Name "UserAuthentication" -Value 0 -Force
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-              -Name "SecurityLayer" -Value 0 -Force
-
-            # Restart TermService to apply changes
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
             Restart-Service -Name TermService -Force -ErrorAction Stop
-            Write-Host "RDP configured."
-          } catch {
-            Write-Error "Failed to configure RDP: $_"
-            throw
-          }
+          } catch { Write-Error "Failed to configure RDP: $_"; throw }
 
-      - name: Create RDP user with secure random password (masked)
+      - name: Create RDP user with secure random password (password printed openly)
         id: create_user
         shell: powershell
         run: |
-          try {
-            Write-Host "Generating secure password..."
-            $upper = [char[]](65..90)
-            $lower = [char[]](97..122)
-            $num   = [char[]](48..57)
-            $special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $num   = [char[]](48..57)
+          $special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
 
-            $pwChars = @()
-            $pwChars += $upper  | Get-Random -Count 4
-            $pwChars += $lower  | Get-Random -Count 4
-            $pwChars += $num    | Get-Random -Count 4
-            $pwChars += $special| Get-Random -Count 4
-            $password = -join ($pwChars | Sort-Object { Get-Random } )
+          $pwChars = @()
+          $pwChars += $upper  | Get-Random -Count 4
+          $pwChars += $lower  | Get-Random -Count 4
+          $pwChars += $num    | Get-Random -Count 4
+          $pwChars += $special| Get-Random -Count 4
+          $password = -join ($pwChars | Sort-Object { Get-Random } )
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-            # Mask the password in GitHub Actions log
-            Write-Host "::add-mask::$password"
-
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-            # Create local user (if exists, update password)
-            $userName = "RDP"
-            if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
-              Write-Host "Local user '$userName' already exists. Updating password."
-              $user = Get-LocalUser -Name $userName
-              $user | Set-LocalUser -Password $securePass
-            } else {
-              New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false -PasswordNeverExpires:$true -ErrorAction Stop
-              Write-Host "Created local user '$userName'."
-            }
-
-            # Ensure membership in Remote Desktop Users and Administrators (optional)
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
-            Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
-
-            # Persist credentials to job outputs (do not print them)
-            echo "::set-output name=username::$userName"
-            echo "::set-output name=password::$password"
-          } catch {
-            Write-Error "Failed to create user: $_"
-            throw
+          $userName = "RDP"
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $userName -Password $securePass
+          } else {
+            New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -PasswordNeverExpires:$true -ErrorAction Stop
           }
 
-      - name: Install Tailscale (stable MSI)
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
+
+          # Export outputs (new recommended way)
+          "username=$userName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "password=$password" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # Print plain credentials (YOU REQUESTED THIS — WARNING: visible in logs)
+          Write-Host "RDP Username: $userName"
+          Write-Host "RDP Password: $password"
+
+      - name: Install Tailscale
         shell: powershell
         run: |
-          try {
-            $installer = "$env:TEMP\tailscale.msi"
-            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-            Write-Host "Downloading Tailscale..."
-            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -ErrorAction Stop
-            Write-Host "Installing Tailscale..."
-            Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait -NoNewWindow
-            Remove-Item $installer -Force -ErrorAction SilentlyContinue
-            Write-Host "Tailscale installed."
-          } catch {
-            Write-Error "Tailscale install failed: $_"
-            throw
-          }
+          $installer = "$env:TEMP\tailscale.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
 
-      - name: Start and authenticate Tailscale
+      - name: Start Tailscale (auth key from repo secret)
         id: tailscale_up
         shell: powershell
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          try {
-            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-            if (-not (Test-Path $exe)) {
-              throw "tailscale.exe not found at $exe"
-            }
-
-            $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-            Write-Host "Starting Tailscale with hostname: $hostname"
-            & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes=false --accept-dns=false
-            Start-Sleep -Seconds 3
-
-            # Wait until tailscale reports an IPv4 address
-            $tsIP = $null
-            $retries = 0
-            while (-not $tsIP -and $retries -lt 12) {
-                $tsIP = (& $exe ip -4) -join "`n"
-                $tsIP = $tsIP.Trim()
-                if ($tsIP) { break }
-                Start-Sleep -Seconds 5
-                $retries++
-            }
-
-            if (-not $tsIP) {
-              throw "Tailscale IPv4 address not assigned."
-            }
-
-            Write-Host "Tailscale IP: $tsIP"
-            echo "::set-output name=tailscale_ip::$tsIP"
-
-            # Determine Tailscale interface(s)
-            $tsAdapters = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -like '*Tailscale*' }
-            if (-not $tsAdapters) {
-              Write-Host "No net adapter explicitly named 'Tailscale' found. Listing all adapters for debugging:"
-              Get-NetAdapter | Format-Table -AutoSize
-            } else {
-              Write-Host "Found Tailscale adapters: $($tsAdapters | ForEach-Object Name -join ', ')"
-            }
-          } catch {
-            Write-Error "Tailscale start failed: $_"
-            throw
+          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes=false --accept-dns=false
+          Start-Sleep -Seconds 3
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+            $tsIP = (& $exe ip -4) -join "`n"
+            $tsIP = $tsIP.Trim()
+            Start-Sleep -Seconds 5
+            $retries++
           }
+          if (-not $tsIP) { throw "Tailscale IPv4 address not assigned." }
+          "tailscale_ip=$tsIP" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Tailscale IP: $tsIP"
 
-      - name: Add firewall rule that only allows RDP via Tailscale adapter(s)
+      - name: Add firewall rule limited to Tailscale subnet
         shell: powershell
         run: |
-          try {
-            $rdpPort = 3389
-            # Attempt to find the Tailscale interface(s)
-            $tsIf = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -like '*Tailscale*' }
-            if ($tsIf) {
-              foreach ($if in $tsIf) {
-                $ifAlias = $if.Name
-                Write-Host "Creating firewall rule bound to interface alias: $ifAlias"
-                # Remove any duplicate rule first
-                if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" -ErrorAction SilentlyContinue) {
-                  Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-                }
-                New-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" `
-                  -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort `
-                  -InterfaceAlias $ifAlias -Profile Any -ErrorAction Stop
-              }
-            } else {
-              # Fallback: only allow incoming on 3389 from Tailscale subnet range (100.64.0.0/10)
-              Write-Host "Tailscale adapter not found. Creating firewall rule restricted to Tailscale subnet (100.64.0.0/10)."
-              if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
-                Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-              }
-              New-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" `
-                -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort `
-                -RemoteAddress "100.64.0.0/10" -Profile Any -ErrorAction Stop
-            }
-            Write-Host "Firewall rules created."
-          } catch {
-            Write-Error "Failed to create firewall rule: $_"
-            throw
+          $rdpPort = 3389
+          # Bind to Tailscale subnet (100.64.0.0/10) to avoid public exposure
+          if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
+            Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
           }
+          New-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort -RemoteAddress "100.64.0.0/10" -Profile Any
 
-      - name: Verify RDP accessibility over Tailscale
+      - name: Verify RDP accessibility
         shell: powershell
         run: |
-          try {
-            $tsIP = '${{ steps.tailscale_up.outputs.tailscale_ip }}'
-            if (-not $tsIP) {
-              throw "No Tailscale IP available for verification."
-            }
-            Write-Host "Testing TCP connectivity to $tsIP:3389"
-            $test = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) {
-              Write-Host "TCP connectivity OK."
-            } else {
-              Write-Warning "TCP connectivity test failed. It may still be reachable from tailnet peers even if Test-NetConnection from here fails."
-            }
+          $tsIP = '${{ steps.tailscale_up.outputs.tailscale_ip }}'
+          Write-Host "Testing RDP connectivity to $tsIP:3389"
+          Test-NetConnection -ComputerName $tsIP -Port 3389
 
-            # Write connection summary to the job summary (safely)
-            $username = '${{ steps.create_user.outputs.username }}'
-            $password = '${{ steps.create_user.outputs.password }}'
-            # Password is masked in logs via ::add-mask:: earlier
-            Write-Host ""
-            Write-Host "=== RDP ACCESS SUMMARY ==="
-            Write-Host "Tailscale IP: $tsIP"
-            Write-Host "Username: $username"
-            Write-Host "Password: [masked]"
-            Write-Host "To connect: use the Tailscale IP shown above from another tailnet device."
-            Write-Host "=========================="
-          } catch {
-            Write-Error "Verification step failed: $_"
-            throw
-          }
-
-      - name: Keep connection active (main runtime)
+      - name: Keep connection active (ctrl-c / cancel to stop)
         shell: powershell
         run: |
-          Write-Host "Runner will now keep alive; cancel the workflow to teardown and remove user."
-          while ($true) {
-            Write-Host "[$(Get-Date -Format s)] RDP ready. Press cancel in Actions to stop and cleanup."
-            Start-Sleep -Seconds 300
-          }
+          Write-Host "Runner active. Cancel workflow to stop and invoke cleanup."
+          while ($true) { Write-Host "Alive: $(Get-Date)"; Start-Sleep -Seconds 300 }
 
-      # cleanup always runs if the job finishes or is cancelled
-      - name: Cleanup (stop Tailscale, remove user, remove firewall rules)
+      - name: Cleanup (always)
         if: ${{ always() }}
         shell: powershell
         run: |
-          Write-Host "Cleanup: removing user, firewall rules, and stopping Tailscale..."
-          try {
-            # Stop tailscale
-            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-            if (Test-Path $exe) {
-              & $exe down
-              Start-Sleep -Seconds 2
-              # Optionally uninstall tailscale if you prefer:
-              # Start-Process msiexec.exe -ArgumentList "/x", "Tailscale" -Wait
-            }
-
-            # Remove firewall rules created by this run (name patterns)
-            Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface (*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-            if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
-              Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-            }
-
-            # Remove user (only if it exists)
-            $userName = "RDP"
-            if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
-              # Remove from groups quietly
-              Remove-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
-              Remove-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
-              # Delete account
-              Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
-              Write-Host "Removed local user $userName"
-            } else {
-              Write-Host "Local user $userName not present."
-            }
-
-            Write-Host "Cleanup complete."
-          } catch {
-            Write-Warning "Cleanup encountered errors: $_"
+          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (Test-Path $exe) { & $exe down }
+          if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
+            Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          }
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
           }
