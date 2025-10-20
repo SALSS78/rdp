@@ -1,4 +1,4 @@
-name: RDP-Ubuntu-Tailscale
+name: RDP-Ubuntu-Tailscale-With-Visible-Creds
 
 on:
   workflow_dispatch:
@@ -12,88 +12,79 @@ jobs:
       - name: Prepare shell
         run: |
           set -euo pipefail
-          # show which distro
           lsb_release -a || true
 
-      - name: Create RDP user and generate strong password (masked)
-        id: create_user
+      - name: Generate credentials (root + rdpuser) and set on system (VISIBLE)
+        id: create_creds
         run: |
           set -euo pipefail
 
-          USERNAME="rdpuser"
-          # Generate a 24-character password with required classes
-          # We build it from sets to ensure at least one of each class
-          U=$(tr -dc 'A-Z' </dev/urandom | head -c4)
-          L=$(tr -dc 'a-z' </dev/urandom | head -c8)
-          N=$(tr -dc '0-9' </dev/urandom | head -c6)
-          S=$(tr -dc '!@#$%&*()-_=+[]{}<>?/' </dev/urandom | head -c6)
-          RAW="${U}${L}${N}${S}"
-          # Shuffle characters
-          PASSWORD=$(echo "$RAW" | fold -w1 | shuf | tr -d '\n')
-          # Fallback if generation failed
-          if [ -z "$PASSWORD" ]; then
-            PASSWORD=$(openssl rand -base64 18)
-          fi
+          # Username for RDP user
+          RDPUSER="rdpuser"
 
-          # Mask password in GitHub Actions logs
-          echo "::add-mask::$PASSWORD"
+          # Generate passwords (24 chars each)
+          genpw() {
+            U=$(tr -dc 'A-Z' </dev/urandom | head -c4)
+            L=$(tr -dc 'a-z' </dev/urandom | head -c8)
+            N=$(tr -dc '0-9' </dev/urandom | head -c6)
+            S=$(tr -dc '!@#$%&*()-_=+[]{}<>?/' </dev/urandom | head -c6)
+            RAW="${U}${L}${N}${S}"
+            echo "$(echo "$RAW" | fold -w1 | shuf | tr -d '\n')"
+          }
 
-          # If user exists update password, else create
-          if id -u "$USERNAME" >/dev/null 2>&1; then
-            echo "User exists, updating password"
-            echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          RDP_PASS=$(genpw)
+          ROOT_PASS=$(genpw)
+
+          # Ensure rdp user exists and set password
+          if id -u "$RDPUSER" >/dev/null 2>&1; then
+            echo "User $RDPUSER exists - updating password."
+            echo "${RDPUSER}:${RDP_PASS}" | sudo chpasswd
           else
-            sudo useradd -m -s /bin/bash "$USERNAME"
-            echo "$USERNAME:$PASSWORD" | sudo chpasswd
-            # Optional: allow passwordless sudo? No — add to sudo group only
-            sudo usermod -aG sudo "$USERNAME"
+            sudo useradd -m -s /bin/bash "$RDPUSER"
+            echo "${RDPUSER}:${RDP_PASS}" | sudo chpasswd
+            # give sudo - optional, remove if undesired
+            sudo usermod -aG sudo "$RDPUSER"
           fi
 
-          # Ensure xrdp group membership later; output username/password to job outputs (password masked)
-          echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
-          echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+          # Unlock and set root password
+          echo "Setting root password (enabling root account)..."
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+          # Ensure root has a valid shell
+          sudo usermod -s /bin/bash root || true
 
-      - name: Install xrdp, desktop (Xfce), and utilities
+          # Export outputs for other steps
+          echo "rdpuser=${RDPUSER}" >> "$GITHUB_OUTPUT"
+          echo "rdppass=${RDP_PASS}" >> "$GITHUB_OUTPUT"
+          echo "rootpass=${ROOT_PASS}" >> "$GITHUB_OUTPUT"
+
+      - name: Install xrdp, Xfce and utilities
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xrdp xfce4 xfce4-goodies dbus-x11 xorgxrdp iproute2 jq curl ca-certificates
-          # Ensure xrdp uses Xorg session
-          sudo sed -i.bak '/^allowed_users/s/=.*/=anybody/' /etc/X11/Xwrapper.config || true
-          # Create .xsession for ubuntu desktop for the rdp user (if not present)
-          sudo -u "$GITHUB_ENV" true || true
-          # We'll configure for the created user below
-          # Enable and start xrdp
-          sudo systemctl enable xrdp --now
+            xrdp xfce4 xfce4-goodies dbus-x11 xorgxrdp iproute2 jq curl ca-certificates ufw
+          # Allow anybody to start X (permits root desktop sessions)
+          sudo sed -i.bak 's/^allowed_users=.*/allowed_users=anybody/' /etc/X11/Xwrapper.config || true
+          # Create .xsession for rdpuser to start xfce
+          RDPUSER="${{ steps.create_creds.outputs.rdpuser }}"
+          sudo -u "$RDPUSER" bash -c 'echo "startxfce4" > ~/.xsession; chmod 644 ~/.xsession'
+          sudo systemctl enable --now xrdp
           sudo systemctl restart xrdp
 
-      - name: Configure xrdp session for the rdp user
-        run: |
-          set -euo pipefail
-          USERNAME="${{ steps.create_user.outputs.username }}"
-          # create .xsession to start Xfce
-          sudo -u "$USERNAME" bash -c 'echo "startxfce4" > ~/.xsession; chmod 644 ~/.xsession'
-          # ensure user owns files
-          sudo chown "$USERNAME":"$USERNAME" /home/"$USERNAME"/.xsession
-
-      - name: Install Tailscale (stable) and bring up
+      - name: Install & start Tailscale (stable) and bring up
         id: tailscale_up
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
-          # Add Tailscale apt repo and install
+          # Add Tailscale repo (uses focal as common path - works on runners)
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          # Using focal as package path works across many runners; if runner differs, ok.
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main" | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt-get update
           sudo apt-get install -y tailscale
 
-          # Start tailscale service (systemd)
           sudo systemctl enable --now tailscaled
 
-          # Bring up with auth key and a unique hostname
           HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" --accept-routes=false --accept-dns=false || {
             echo "tailscale up failed; printing status for debugging"
@@ -101,13 +92,11 @@ jobs:
             exit 1
           }
 
-          # Wait for IPv4 address
+          TS_IP=""
           for i in {1..12}; do
-            TS_IP=$(tailscale ip -4 || true)
+            TS_IP=$(sudo tailscale ip -4 || true)
             TS_IP="${TS_IP:-}"
-            if [ -n "$TS_IP" ]; then
-              break
-            fi
+            if [ -n "$TS_IP" ]; then break; fi
             sleep 5
           done
 
@@ -116,52 +105,39 @@ jobs:
             exit 1
           fi
 
-          echo "tailscale_ip=$TS_IP" >> "$GITHUB_OUTPUT"
+          echo "tailscale_ip=${TS_IP}" >> "$GITHUB_OUTPUT"
 
       - name: Configure UFW to allow RDP only from Tailscale subnet
         run: |
           set -euo pipefail
-          # Install ufw if missing
-          sudo apt-get install -y ufw
-          # Reset/prepare UFW (do NOT disable existing SSH if you use it; runners typically don't expose ports)
           sudo ufw --force reset
-
-          # Default deny incoming
           sudo ufw default deny incoming
           sudo ufw default allow outgoing
-
-          # Allow RDP (3389) only from Tailscale private subnet 100.64.0.0/10
           sudo ufw allow from 100.64.0.0/10 to any port 3389 proto tcp comment 'RDP via Tailscale'
-
-          # Allow local loopback and established
-          sudo ufw allow proto tcp from any to any port 22 comment 'ssh-if-needed' || true
-
-          # Enable UFW
+          # Keep SSH allowance optional (runners don't expose SSH)
           echo "y" | sudo ufw enable || true
           sudo ufw status verbose
 
-      - name: Verify RDP connectivity (local test) and show access info
+      - name: Print credentials (VISIBLE) and connection info
         run: |
           set -euo pipefail
           TS_IP="${{ steps.tailscale_up.outputs.tailscale_ip }}"
-          echo "Tailscale IP: $TS_IP"
-          # Test netcat/tcp connection locally
-          if command -v ss >/dev/null 2>&1; then
-            ss -tnl | grep 3389 || true
-          fi
-          # show summary to logs (password masked above)
-          echo "=== RDP ACCESS SUMMARY ==="
-          echo "Address: $TS_IP"
-          echo "Username: ${{ steps.create_user.outputs.username }}"
-          echo "Password: [masked]"
-          echo "Connect from another tailnet device to the IP above using an RDP client."
-          echo "=========================="
+          echo
+          echo "=================== RDP ACCESS (VISIBLE CREDS) ==================="
+          echo "Tailscale IP: ${TS_IP}"
+          echo "RDP username: ${{ steps.create_creds.outputs.rdpuser }}"
+          echo "RDP password: ${{ steps.create_creds.outputs.rdppass }}"
+          echo "ROOT username: root"
+          echo "ROOT password: ${{ steps.create_creds.outputs.rootpass }}"
+          echo "=================================================================="
+          echo
+          echo "Connect using an RDP client from another device in your Tailnet to the Tailscale IP above."
+          echo "Note: root can be used to log in if your client supports it."
 
       - name: Keep runner alive (main runtime)
         run: |
           set -euo pipefail
-          echo "Runner will keep alive; cancel the workflow to teardown and cleanup."
-          # Simple keep-alive loop
+          echo "Runner will keep alive; cancel workflow to terminate and run cleanup."
           while true; do
             echo "[$(date -Is)] RDP ready. Cancel workflow to stop and cleanup."
             sleep 300
@@ -171,23 +147,27 @@ jobs:
         if: ${{ always() }}
         run: |
           set -euo pipefail
-          echo "Cleanup: stopping tailscale, removing user and firewall rules..."
-          # Stop tailscale
+          echo "Cleanup: stopping tailscale, removing rdp user, disabling root password, resetting UFW and stopping xrdp..."
+          # Bring tailscale down
           sudo tailscale down || true
           sudo systemctl stop tailscaled || true
 
-          # Remove user created (only if present)
-          USERNAME="${{ steps.create_user.outputs.username }}"
-          if id -u "$USERNAME" >/dev/null 2>&1; then
-            sudo deluser --remove-home "$USERNAME" || true
-            echo "Removed user $USERNAME"
+          # Remove rdpuser and its home (if exists)
+          RDPUSER="${{ steps.create_creds.outputs.rdpuser }}"
+          if id -u "$RDPUSER" >/dev/null 2>&1; then
+            sudo deluser --remove-home "$RDPUSER" || true
+            echo "Removed $RDPUSER"
           else
-            echo "User $USERNAME not present."
+            echo "User $RDPUSER not present"
           fi
 
-          # Reset ufw to default (be careful on real servers)
+          # Lock root again (optional) — comment out if you want to keep root enabled
+          # sudo passwd -l root || true
+
+          # Reset ufw
           sudo ufw --force reset || true
 
           # Stop xrdp
           sudo systemctl stop xrdp || true
-          echo "Cleanup finished."
+
+          echo "Cleanup complete."
