@@ -1,180 +1,266 @@
-name: RDP-Ubuntu-Desktop-With-Visible-Password
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-ubuntu:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Prepare shell
+      - name: Set PowerShell execution policy for this job
         run: |
-          set -euo pipefail
-          echo "Runner: $(uname -a)"
-          lsb_release -a || true
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        shell: powershell
 
-      - name: Generate credentials (RDP user) and set on system — password VISIBLE
-        id: create_creds
+      - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          set -euo pipefail
+          try {
+            Write-Host "Configuring RDP settings..."
+            # Enable Remote Desktop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fDenyTSConnections" -Value 0 -Force
 
-          RDPUSER="rdpuser"
+            # Disable Network Level Authentication only if explicitly required.
+            # (If you want NLA, set UserAuthentication to 1 & ensure account has password)
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "UserAuthentication" -Value 0 -Force
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "SecurityLayer" -Value 0 -Force
 
-          # Use Python's secrets to create a strong 24-char password (quiet, reliable)
-          RDP_PASS=$(python3 - <<'PY'
-import secrets, string
-chars = string.ascii_letters + string.digits + "!@#$%&*()-_=+[]{}<>?/"
-print(''.join(secrets.choice(chars) for _ in range(24)))
-PY
-)
+            # Restart TermService to apply changes
+            Restart-Service -Name TermService -Force -ErrorAction Stop
+            Write-Host "RDP configured."
+          } catch {
+            Write-Error "Failed to configure RDP: $_"
+            throw
+          }
 
-          # Also create a root password but we will NOT print it
-          ROOT_PASS=$(python3 - <<'PY'
-import secrets, string
-chars = string.ascii_letters + string.digits + "!@#$%&*()-_=+[]{}<>?/"
-print(''.join(secrets.choice(chars) for _ in range(24)))
-PY
-)
-
-          # Create or update the RDP user and set passwords
-          if id -u "$RDPUSER" >/dev/null 2>&1; then
-            echo "User $RDPUSER exists — updating password."
-            echo "${RDPUSER}:${RDP_PASS}" | sudo chpasswd
-          else
-            sudo useradd -m -s /bin/bash "$RDPUSER"
-            echo "${RDPUSER}:${RDP_PASS}" | sudo chpasswd
-            # Add to sudo group (optional)
-            sudo usermod -aG sudo "$RDPUSER"
-          fi
-
-          # Enable/set the root password (we will NOT reveal it)
-          echo "root:${ROOT_PASS}" | sudo chpasswd
-          sudo usermod -s /bin/bash root || true
-
-          # Output only the password (visible). Username is known (rdpuser).
-          echo "rdp_password=${RDP_PASS}" >> "$GITHUB_OUTPUT"
-          echo "rdp_user=${RDPUSER}" >> "$GITHUB_OUTPUT"
-          # Do not output root password
-
-      - name: Install Xfce desktop + xrdp + utilities
+      - name: Create RDP user with secure random password (masked)
+        id: create_user
+        shell: powershell
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          # Install a lightweight desktop (Xfce) plus xrdp. If you prefer full Ubuntu Desktop,
-          # replace xfce4 with 'ubuntu-desktop' (very large).
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            xfce4 xfce4-goodies xorgxrdp xrdp dbus-x11 iproute2 curl ca-certificates ufw jq
+          try {
+            Write-Host "Generating secure password..."
+            $upper = [char[]](65..90)
+            $lower = [char[]](97..122)
+            $num   = [char[]](48..57)
+            $special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
 
-          # Allow anybody to start X (permissive needed for some xrdp configs)
-          sudo sed -i.bak 's/^allowed_users=.*/allowed_users=anybody/' /etc/X11/Xwrapper.config || true
+            $pwChars = @()
+            $pwChars += $upper  | Get-Random -Count 4
+            $pwChars += $lower  | Get-Random -Count 4
+            $pwChars += $num    | Get-Random -Count 4
+            $pwChars += $special| Get-Random -Count 4
+            $password = -join ($pwChars | Sort-Object { Get-Random } )
 
-          # Create .xsession for rdp user to start xfce
-          RDPUSER="${{ steps.create_creds.outputs.rdp_user }}"
-          sudo -u "$RDPUSER" bash -lc 'echo "startxfce4" > ~/.xsession && chmod 644 ~/.xsession'
+            # Mask the password in GitHub Actions log
+            Write-Host "::add-mask::$password"
 
-          # Enable and start xrdp service
-          sudo systemctl enable --now xrdp
-          sudo systemctl restart xrdp
-          sudo systemctl status xrdp --no-pager || true
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-      - name: Install & start Tailscale and bring up
+            # Create local user (if exists, update password)
+            $userName = "RDP"
+            if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+              Write-Host "Local user '$userName' already exists. Updating password."
+              $user = Get-LocalUser -Name $userName
+              $user | Set-LocalUser -Password $securePass
+            } else {
+              New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false -PasswordNeverExpires:$true -ErrorAction Stop
+              Write-Host "Created local user '$userName'."
+            }
+
+            # Ensure membership in Remote Desktop Users and Administrators (optional)
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
+
+            # Persist credentials to job outputs (do not print them)
+            echo "::set-output name=username::$userName"
+            echo "::set-output name=password::$password"
+          } catch {
+            Write-Error "Failed to create user: $_"
+            throw
+          }
+
+      - name: Install Tailscale (stable MSI)
+        shell: powershell
+        run: |
+          try {
+            $installer = "$env:TEMP\tailscale.msi"
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            Write-Host "Downloading Tailscale..."
+            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -ErrorAction Stop
+            Write-Host "Installing Tailscale..."
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait -NoNewWindow
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            Write-Host "Tailscale installed."
+          } catch {
+            Write-Error "Tailscale install failed: $_"
+            throw
+          }
+
+      - name: Start and authenticate Tailscale
         id: tailscale_up
+        shell: powershell
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          set -euo pipefail
-          # Add Tailscale repository (focal path works on runners)
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main" | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update
-          sudo apt-get install -y tailscale
+          try {
+            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (-not (Test-Path $exe)) {
+              throw "tailscale.exe not found at $exe"
+            }
 
-          sudo systemctl enable --now tailscaled
+            $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+            Write-Host "Starting Tailscale with hostname: $hostname"
+            & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes=false --accept-dns=false
+            Start-Sleep -Seconds 3
 
-          HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
-          # Bring up tailscale; fail early with status if it fails
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" --accept-routes=false --accept-dns=false || {
-            echo "tailscale up failed; printing status:"
-            sudo tailscale status || true
-            exit 1
+            # Wait until tailscale reports an IPv4 address
+            $tsIP = $null
+            $retries = 0
+            while (-not $tsIP -and $retries -lt 12) {
+                $tsIP = (& $exe ip -4) -join "`n"
+                $tsIP = $tsIP.Trim()
+                if ($tsIP) { break }
+                Start-Sleep -Seconds 5
+                $retries++
+            }
+
+            if (-not $tsIP) {
+              throw "Tailscale IPv4 address not assigned."
+            }
+
+            Write-Host "Tailscale IP: $tsIP"
+            echo "::set-output name=tailscale_ip::$tsIP"
+
+            # Determine Tailscale interface(s)
+            $tsAdapters = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -like '*Tailscale*' }
+            if (-not $tsAdapters) {
+              Write-Host "No net adapter explicitly named 'Tailscale' found. Listing all adapters for debugging:"
+              Get-NetAdapter | Format-Table -AutoSize
+            } else {
+              Write-Host "Found Tailscale adapters: $($tsAdapters | ForEach-Object Name -join ', ')"
+            }
+          } catch {
+            Write-Error "Tailscale start failed: $_"
+            throw
           }
 
-          # Wait for IPv4 to be assigned
-          TS_IP=""
-          for i in {1..12}; do
-            TS_IP=$(sudo tailscale ip -4 || true)
-            TS_IP="${TS_IP:-}"
-            if [ -n "$TS_IP" ]; then break; fi
-            sleep 3
-          done
-
-          if [ -z "${TS_IP:-}" ]; then
-            echo "ERROR: no tailscale IPv4 assigned"
-            exit 1
-          fi
-
-          echo "tailscale_ip=${TS_IP}" >> "$GITHUB_OUTPUT"
-
-      - name: Configure UFW to allow RDP only from Tailscale subnet
+      - name: Add firewall rule that only allows RDP via Tailscale adapter(s)
+        shell: powershell
         run: |
-          set -euo pipefail
-          sudo ufw --force reset
-          sudo ufw default deny incoming
-          sudo ufw default allow outgoing
-          # Allow RDP only from Tailscale range
-          sudo ufw allow from 100.64.0.0/10 to any port 3389 proto tcp comment 'RDP via Tailscale'
-          # If you need SSH for debugging, enable it intentionally
-          # sudo ufw allow ssh
-          echo "y" | sudo ufw enable || true
-          sudo ufw status verbose
+          try {
+            $rdpPort = 3389
+            # Attempt to find the Tailscale interface(s)
+            $tsIf = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -like '*Tailscale*' }
+            if ($tsIf) {
+              foreach ($if in $tsIf) {
+                $ifAlias = $if.Name
+                Write-Host "Creating firewall rule bound to interface alias: $ifAlias"
+                # Remove any duplicate rule first
+                if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" -ErrorAction SilentlyContinue) {
+                  Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+                }
+                New-NetFirewallRule -DisplayName "RDP - Tailscale Interface ($ifAlias)" `
+                  -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort `
+                  -InterfaceAlias $ifAlias -Profile Any -ErrorAction Stop
+              }
+            } else {
+              # Fallback: only allow incoming on 3389 from Tailscale subnet range (100.64.0.0/10)
+              Write-Host "Tailscale adapter not found. Creating firewall rule restricted to Tailscale subnet (100.64.0.0/10)."
+              if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
+                Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+              }
+              New-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort `
+                -RemoteAddress "100.64.0.0/10" -Profile Any -ErrorAction Stop
+            }
+            Write-Host "Firewall rules created."
+          } catch {
+            Write-Error "Failed to create firewall rule: $_"
+            throw
+          }
 
-      - name: Print only the RDP password (VISIBLE) and connection info
+      - name: Verify RDP accessibility over Tailscale
+        shell: powershell
         run: |
-          set -euo pipefail
-          TS_IP="${{ steps.tailscale_up.outputs.tailscale_ip }}"
-          RDPUSER="${{ steps.create_creds.outputs.rdp_user }}"
-          RDP_PASS="${{ steps.create_creds.outputs.rdp_password }}"
+          try {
+            $tsIP = '${{ steps.tailscale_up.outputs.tailscale_ip }}'
+            if (-not $tsIP) {
+              throw "No Tailscale IP available for verification."
+            }
+            Write-Host "Testing TCP connectivity to $tsIP:3389"
+            $test = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Host "TCP connectivity OK."
+            } else {
+              Write-Warning "TCP connectivity test failed. It may still be reachable from tailnet peers even if Test-NetConnection from here fails."
+            }
 
-          echo
-          echo "================ RDP ACCESS (PASSWORD VISIBLE) ================"
-          echo "Tailscale IP: ${TS_IP}"
-          echo "RDP username: ${RDPUSER}"
-          # This is the only field printed in plaintext per your request:
-          echo "RDP password: ${RDP_PASS}"
-          echo "================================================================"
-          echo "Connect from another tailnet device to the Tailscale IP with an RDP client."
-          echo
+            # Write connection summary to the job summary (safely)
+            $username = '${{ steps.create_user.outputs.username }}'
+            $password = '${{ steps.create_user.outputs.password }}'
+            # Password is masked in logs via ::add-mask:: earlier
+            Write-Host ""
+            Write-Host "=== RDP ACCESS SUMMARY ==="
+            Write-Host "Tailscale IP: $tsIP"
+            Write-Host "Username: $username"
+            Write-Host "Password: [masked]"
+            Write-Host "To connect: use the Tailscale IP shown above from another tailnet device."
+            Write-Host "=========================="
+          } catch {
+            Write-Error "Verification step failed: $_"
+            throw
+          }
 
-      - name: Keep runner alive (main runtime)
+      - name: Keep connection active (main runtime)
+        shell: powershell
         run: |
-          set -euo pipefail
-          echo "Runner will keep alive; cancel the workflow to teardown and run cleanup."
-          while true; do
-            echo "[$(date -Is)] RDP ready. Cancel workflow to stop and cleanup."
-            sleep 300
-          done
+          Write-Host "Runner will now keep alive; cancel the workflow to teardown and remove user."
+          while ($true) {
+            Write-Host "[$(Get-Date -Format s)] RDP ready. Press cancel in Actions to stop and cleanup."
+            Start-Sleep -Seconds 300
+          }
 
-      - name: Cleanup (always)
+      # cleanup always runs if the job finishes or is cancelled
+      - name: Cleanup (stop Tailscale, remove user, remove firewall rules)
         if: ${{ always() }}
+        shell: powershell
         run: |
-          set -euo pipefail
-          echo "Cleanup: stopping tailscale, removing rdp user, resetting UFW and stopping xrdp..."
-          sudo tailscale down || true
-          sudo systemctl stop tailscaled || true
+          Write-Host "Cleanup: removing user, firewall rules, and stopping Tailscale..."
+          try {
+            # Stop tailscale
+            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (Test-Path $exe) {
+              & $exe down
+              Start-Sleep -Seconds 2
+              # Optionally uninstall tailscale if you prefer:
+              # Start-Process msiexec.exe -ArgumentList "/x", "Tailscale" -Wait
+            }
 
-          RDPUSER="${{ steps.create_creds.outputs.rdp_user }}"
-          if id -u "$RDPUSER" >/dev/null 2>&1; then
-            sudo deluser --remove-home "$RDPUSER" || true
-            echo "Removed $RDPUSER"
-          else
-            echo "User $RDPUSER not present"
-          fi
+            # Remove firewall rules created by this run (name patterns)
+            Get-NetFirewallRule -DisplayName "RDP - Tailscale Interface (*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
+              Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            }
 
-          # Optionally lock root again - uncomment to lock:
-          # sudo passwd -l root || true
+            # Remove user (only if it exists)
+            $userName = "RDP"
+            if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+              # Remove from groups quietly
+              Remove-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+              Remove-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
+              # Delete account
+              Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
+              Write-Host "Removed local user $userName"
+            } else {
+              Write-Host "Local user $userName not present."
+            }
 
-          sudo ufw --force reset || true
-          sudo systemctl stop xrdp || true
-          echo "Cleanup finished."
+            Write-Host "Cleanup complete."
+          } catch {
+            Write-Warning "Cleanup encountered errors: $_"
+          }
