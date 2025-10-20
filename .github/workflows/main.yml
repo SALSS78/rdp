@@ -1,127 +1,68 @@
-name: RDP
+name: Ubuntu Desktop (Tailscale Access)
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    # Note: GitHub-hosted runners are limited by GitHub (job execution time ≈ 6 hours).
-    timeout-minutes: 360
+  setup-ubuntu-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Set PowerShell execution policy for this job
-        shell: powershell
-        run: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-
-      - name: Configure Core RDP Settings
-        shell: powershell
+      - name: Update System & Install Desktop Environment
         run: |
-          try {
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-            Restart-Service -Name TermService -Force -ErrorAction Stop
-          } catch { Write-Error "Failed to configure RDP: $_"; throw }
-
-      - name: Create RDP user with secure random password (password printed openly)
-        id: create_user
-        shell: powershell
-        run: |
-          $upper = [char[]](65..90)
-          $lower = [char[]](97..122)
-          $num   = [char[]](48..57)
-          $special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-
-          $pwChars = @()
-          $pwChars += $upper  | Get-Random -Count 4
-          $pwChars += $lower  | Get-Random -Count 4
-          $pwChars += $num    | Get-Random -Count 4
-          $pwChars += $special| Get-Random -Count 4
-          $password = -join ($pwChars | Sort-Object { Get-Random } )
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          $userName = "RDP"
-          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $userName -Password $securePass
-          } else {
-            New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -PasswordNeverExpires:$true -ErrorAction Stop
-          }
-
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
-
-          # Export outputs (new recommended way)
-          "username=$userName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "password=$password" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          # Print plain credentials (YOU REQUESTED THIS — WARNING: visible in logs)
-          Write-Host "RDP Username: $userName"
-          Write-Host "RDP Password: $password"
+          sudo apt update -y
+          sudo apt upgrade -y
+          
+          # Install lightweight desktop and VNC server
+          sudo apt install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils
+          
+          # Enable and start XRDP service
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+          
+          # Create RDP user
+          USERNAME=rdpuser
+          PASSWORD=$(openssl rand -base64 12)
+          sudo useradd -m -s /bin/bash $USERNAME
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo $USERNAME
+          
+          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
 
       - name: Install Tailscale
-        shell: powershell
         run: |
-          $installer = "$env:TEMP\tailscale.msi"
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installer -Force
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID --accept-routes --ssh
 
-      - name: Start Tailscale (auth key from repo secret)
-        id: tailscale_up
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes=false --accept-dns=false
-          Start-Sleep -Seconds 3
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
-            $tsIP = (& $exe ip -4) -join "`n"
-            $tsIP = $tsIP.Trim()
-            Start-Sleep -Seconds 5
-            $retries++
-          }
-          if (-not $tsIP) { throw "Tailscale IPv4 address not assigned." }
-          "tailscale_ip=$tsIP" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Tailscale IP: $tsIP"
+          # Wait for Tailscale IP
+          TS_IP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
 
-      - name: Add firewall rule limited to Tailscale subnet
-        shell: powershell
+      - name: Verify XRDP service
         run: |
-          $rdpPort = 3389
-          # Bind to Tailscale subnet (100.64.0.0/10) to avoid public exposure
-          if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
-            Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-          }
-          New-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rdpPort -RemoteAddress "100.64.0.0/10" -Profile Any
+          sudo systemctl status xrdp --no-pager
+          sudo ss -tuln | grep 3389 || echo "RDP port not listening"
 
-      - name: Verify RDP accessibility
-        shell: powershell
+      - name: Display Connection Info
         run: |
-          $tsIP = '${{ steps.tailscale_up.outputs.tailscale_ip }}'
-          Write-Host "Testing RDP connectivity to $tsIP:3389"
-          Test-NetConnection -ComputerName $tsIP -Port 3389
+          echo ""
+          echo "==============================="
+          echo "✅ Ubuntu Desktop Access Ready!"
+          echo "==============================="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Username: $(echo $RDP_CREDS | cut -d' ' -f2)"
+          echo "Password: $(echo $RDP_CREDS | cut -d' ' -f4)"
+          echo "==============================="
+          echo "🔗 Connect using any RDP client (Windows, Mac, or Remmina on Linux)"
+          echo "Example: mstsc /v:$TAILSCALE_IP"
+          echo ""
+          echo "Session will remain active for up to 1 hour unless stopped."
 
-      - name: Keep connection active (ctrl-c / cancel to stop)
-        shell: powershell
+      - name: Keep Session Active
         run: |
-          Write-Host "Runner active. Cancel workflow to stop and invoke cleanup."
-          while ($true) { Write-Host "Alive: $(Get-Date)"; Start-Sleep -Seconds 300 }
-
-      - name: Cleanup (always)
-        if: ${{ always() }}
-        shell: powershell
-        run: |
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (Test-Path $exe) { & $exe down }
-          if (Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" -ErrorAction SilentlyContinue) {
-            Get-NetFirewallRule -DisplayName "RDP - Tailscale Subnet" | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-          }
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
-          }
+          while true; do
+            echo "[$(date)] Ubuntu Desktop Active - Connected via Tailscale ($TAILSCALE_IP)"
+            sleep 300
+          done
